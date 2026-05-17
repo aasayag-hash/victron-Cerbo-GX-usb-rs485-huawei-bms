@@ -287,6 +287,10 @@ REG_UNLOCK   = 0x0106
 REG_DATETIME = 0x1000
 
 
+def _fmt_temp(t):
+    return ("%.1f" % t) if t is not None else "--"
+
+
 def _crc16(data):
     crc = 0xFFFF
     for b in data:
@@ -503,8 +507,8 @@ class HuaweiEsm(Battery):
         # Temp 1 = pack 0, Temp 2 = pack 1, Temp 3 = pack 2
         # Direct assignment for all slots: to_temperature() crashes on None input
         pack_temps = [p.temp_avg if p.online else None for p in self.packs]
-        self.temperature_1 = pack_temps[0] if len(pack_temps) > 0 else None
-        self.temperature_2 = pack_temps[1] if len(pack_temps) > 1 else None
+        self.temperature_1 = pack_temps[0]
+        self.temperature_2 = pack_temps[1]
         self.temperature_3 = pack_temps[2] if len(pack_temps) > 2 else None
         self.temperature_4 = None
 
@@ -514,17 +518,14 @@ class HuaweiEsm(Battery):
         offline_count = sum(1 for p in self.packs if not p.online)
         self.protection.cell_imbalance = 2 if offline_count else 0
 
-        def _fmt_temp(t):
-            return ("%.1f" % t) if t is not None else "--"
-
         logger.info(
             "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% T1=%s T2=%s T3=%s",
             len(online), len(self.packs),
             self.voltage,
             sum(p.cell_voltage_avg for p in online) / len(online),
             self.current, self.soc, self.soh,
-            _fmt_temp(pack_temps[0] if len(pack_temps) > 0 else None),
-            _fmt_temp(pack_temps[1] if len(pack_temps) > 1 else None),
+            _fmt_temp(pack_temps[0]),
+            _fmt_temp(pack_temps[1]),
             _fmt_temp(pack_temps[2] if len(pack_temps) > 2 else None),
         )
         return True
