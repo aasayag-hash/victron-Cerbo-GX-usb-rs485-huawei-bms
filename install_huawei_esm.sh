@@ -271,7 +271,7 @@ from datetime import datetime
 from battery import Battery, Cell
 from utils import logger, open_serial_port
 
-DRIVER_VERSION = "1.1.0"
+DRIVER_VERSION = "1.2.0"
 
 # Format: (slave_id, capacity_ah, model_name, cells_in_series)
 PACK_CONFIG = ${PACK_CONFIG}
@@ -339,6 +339,7 @@ def _authenticate(ser, slave_id, model):
     time.sleep(0.5)
     if not ok:
         logger.warning("Huawei ESM slave %d: auth step 2 (datetime write) failed", slave_id)
+        return False
     logger.info("Huawei ESM slave %d (%s): authenticated OK", slave_id, model)
     return True
 
@@ -508,15 +509,18 @@ class HuaweiEsm(Battery):
         offline_count = sum(1 for p in self.packs if not p.online)
         self.protection.cell_imbalance = 2 if offline_count else 0
 
+        def _fmt_temp(t):
+            return ("%.1f" % t) if t is not None else "--"
+
         logger.info(
-            "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% T1=%.1f T2=%s T3=%s",
+            "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% T1=%s T2=%s T3=%s",
             len(online), len(self.packs),
             self.voltage,
             sum(p.cell_voltage_avg for p in online) / len(online),
             self.current, self.soc, self.soh,
-            pack_temps[0] if pack_temps[0] is not None else 0,
-            ("%.1f" % pack_temps[1]) if len(pack_temps) > 1 and pack_temps[1] is not None else "--",
-            ("%.1f" % pack_temps[2]) if len(pack_temps) > 2 and pack_temps[2] is not None else "--",
+            _fmt_temp(pack_temps[0] if len(pack_temps) > 0 else None),
+            _fmt_temp(pack_temps[1] if len(pack_temps) > 1 else None),
+            _fmt_temp(pack_temps[2] if len(pack_temps) > 2 else None),
         )
         return True
 DRIVER_EOF
