@@ -424,6 +424,11 @@ class HuaweiEsm(Battery):
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
+    def unique_identifier(self):
+        # Fixed string independent of driver version so Venus OS always maps
+        # this battery to the same DeviceInstance across upgrades/restarts.
+        return "HuaweiESM_" + str(int(self.total_capacity_ah)) + "Ah"
+
     def test_connection(self):
         logger.info("Huawei ESM: testing connection on %s", self.port)
         for attempt in range(20):
