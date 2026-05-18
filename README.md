@@ -37,6 +37,8 @@ El instalador `install_huawei_esm.sh` realiza todo el proceso en un solo comando
 - El último eslabón de la cadena conectado al adaptador USB-RS485
 - Adaptador conectado al puerto USB del Cerbo-S GX
 
+<img width="554" height="172" alt="image" src="https://github.com/user-attachments/assets/bf7c7d90-4460-40f7-a5e6-2311c7ddefa8" />
+
 ### Software
 - Venus OS con **SSH habilitado**: Configuración → General → Acceso root → SSH on
 - Conexión a internet en el Cerbo (para descargar dbus-serialbattery)
