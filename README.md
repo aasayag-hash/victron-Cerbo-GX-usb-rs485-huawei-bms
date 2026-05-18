@@ -7,8 +7,8 @@ Driver e instalador para conectar baterías **Huawei SmartLi ESM-48xxx** directa
 | Hardware | Detalle |
 |----------|---------|
 | Cerbo-S GX | Venus OS v3.x |
-| Huawei ESM-48150B1 | 150 Ah, 48V, 16S LiFePO4 (×2) |
-| Huawei ESM-48100B1 | 100 Ah, 48V, 16S LiFePO4 (×1) |
+| Huawei ESM-48150B1 | 150 Ah, 48V, 16S LiFePO4 |
+| Huawei ESM-48100B1 | 100 Ah, 48V, 16S LiFePO4 |
 | Multiplus-II 48/5000 | VE.Bus ttyS3 |
 | SmartSolar MPPT 150/60 | VE.Direct ttyS2 |
 | Adaptador USB-RS485 | CH340 con aislación galvánica |
