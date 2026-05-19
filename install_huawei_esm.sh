@@ -666,8 +666,6 @@ for i in $(seq 1 20); do
 done
 if [ -n "$INSTANCE" ]; then
     dbus -y com.victronenergy.settings /Settings/SystemSetup/BatteryService SetValue "com.victronenergy.battery/${INSTANCE}" >/dev/null 2>&1
-    # Actualizar config.ini con el DeviceInstance real
-    sed -i "s/^DEVICE_INSTANCE_ID_BATTERY = .*/DEVICE_INSTANCE_ID_BATTERY = ${INSTANCE}/" /data/apps/dbus-serialbattery/config.ini
     ok "BatteryService configurado: com.victronenergy.battery/${INSTANCE}"
     sleep 3
     ACTIVE=$(dbus -y com.victronenergy.system /ActiveBatteryService GetValue 2>/dev/null || echo "")
@@ -681,7 +679,26 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 17. Fin
+# 17. Configurar DVCC: habilitar y fijar CCL desde el valor ingresado
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Configurando DVCC ---"
+
+# Habilitar DVCC
+dbus -y com.victronenergy.settings /Settings/Services/Bol SetValue 1 >/dev/null 2>&1
+ok "DVCC habilitado"
+
+# Activar límite de corriente de carga y fijar el CCL ingresado por el usuario
+dbus -y com.victronenergy.settings /Settings/SystemSetup/MaxChargeCurrent SetValue "${CCL}" >/dev/null 2>&1
+ok "Maximum charge current fijado en ${CCL}A (editable en Settings → DVCC)"
+
+# SVS y STS activados
+dbus -y com.victronenergy.settings /Settings/SystemSetup/SharedVoltageSense SetValue 1 >/dev/null 2>&1
+dbus -y com.victronenergy.settings /Settings/SystemSetup/SharedTemperatureSense SetValue 1 >/dev/null 2>&1
+ok "SVS y STS habilitados"
+
+# ------------------------------------------------------------------------------
+# 18. Fin
 # ------------------------------------------------------------------------------
 echo ""
 echo "Para monitorear en tiempo real:"
