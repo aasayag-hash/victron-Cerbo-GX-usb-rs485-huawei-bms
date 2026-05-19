@@ -267,11 +267,15 @@ cat > "$DRIVER_PATH" << DRIVER_EOF
 import sys
 import struct
 import time
+import configparser
+import os
 from datetime import datetime
 from battery import Battery, Cell
 from utils import logger, open_serial_port
 
-DRIVER_VERSION = "1.2.0"
+DRIVER_VERSION = "1.3.0"
+
+CONFIG_PATH = "/data/apps/dbus-serialbattery/config.ini"
 
 # Format: (slave_id, capacity_ah, model_name, cells_in_series)
 PACK_CONFIG = ${PACK_CONFIG}
@@ -285,6 +289,28 @@ REG_TEMP_MIN = 0x0006
 REG_STATUS   = 0x000A
 REG_UNLOCK   = 0x0106
 REG_DATETIME = 0x1000
+
+
+def _read_ccl_from_config():
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(CONFIG_PATH)
+        val = cfg["DEFAULT"].get("MAX_BATTERY_CHARGE_CURRENT")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _persist_ccl(new_ccl):
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(CONFIG_PATH)
+        cfg["DEFAULT"]["MAX_BATTERY_CHARGE_CURRENT"] = str(int(new_ccl))
+        with open(CONFIG_PATH, "w") as fh:
+            cfg.write(fh)
+        logger.info("Huawei ESM: persisted MAX_BATTERY_CHARGE_CURRENT=%.0f to config.ini", new_ccl)
+    except Exception as exc:
+        logger.warning("Huawei ESM: could not persist CCL to config.ini: %s", exc)
 
 
 def _fmt_temp(t):
@@ -428,6 +454,12 @@ class HuaweiEsm(Battery):
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
+        # CCL: load from config.ini so GUI edits survive restarts
+        saved_ccl = _read_ccl_from_config()
+        if saved_ccl is not None:
+            self.max_battery_charge_current = saved_ccl
+        self._last_persisted_ccl = self.max_battery_charge_current
+
     def unique_identifier(self):
         # Fixed string independent of driver version so Venus OS always maps
         # this battery to the same DeviceInstance across upgrades/restarts.
@@ -518,12 +550,19 @@ class HuaweiEsm(Battery):
         offline_count = sum(1 for p in self.packs if not p.online)
         self.protection.cell_imbalance = 2 if offline_count else 0
 
+        # Persist CCL if user changed it via GUI (/Info/MaxChargeCurrent writeable=True)
+        ccl = self.max_battery_charge_current
+        if ccl is not None and ccl != self._last_persisted_ccl:
+            _persist_ccl(ccl)
+            self._last_persisted_ccl = ccl
+
         logger.info(
-            "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% T1=%s T2=%s T3=%s",
+            "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% CCL=%.0fA T1=%s T2=%s T3=%s",
             len(online), len(self.packs),
             self.voltage,
             sum(p.cell_voltage_avg for p in online) / len(online),
             self.current, self.soc, self.soh,
+            ccl if ccl is not None else 0,
             _fmt_temp(pack_temps[0]),
             _fmt_temp(pack_temps[1]),
             _fmt_temp(pack_temps[2] if len(pack_temps) > 2 else None),
