@@ -11,15 +11,14 @@
 import sys
 import struct
 import time
-import configparser
-import os
 from datetime import datetime
 from battery import Battery, Cell
 from utils import logger, open_serial_port
 
-DRIVER_VERSION = "1.3.0"
+DRIVER_VERSION = "1.4.0"
 
-CONFIG_PATH = "/data/apps/dbus-serialbattery/config.ini"
+# dbus path written by Venus OS GUI: Settings → DVCC → Maximum charge current
+_DVCC_CCL_PATH = ("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent")
 
 # Modbus slave addresses for the 3 packs (validated in field)
 # Format: (slave_id, capacity_ah, model_name, cells_in_series)
@@ -44,30 +43,6 @@ REG_TEMP_MIN = 0x0006  # [6] Min cell temp,   1 deg C, uint16
 REG_STATUS   = 0x000A  # Status bitfield (read separately), uint16
 REG_UNLOCK   = 0x0106  # Auth step 1: read 7 regs
 REG_DATETIME = 0x1000  # Auth step 2: write 6 regs (year,month,day,hour,min,sec)
-
-
-def _read_ccl_from_config() -> float:
-    """Return MAX_BATTERY_CHARGE_CURRENT from config.ini, or None if missing/unreadable."""
-    try:
-        cfg = configparser.ConfigParser()
-        cfg.read(CONFIG_PATH)
-        val = cfg["DEFAULT"].get("MAX_BATTERY_CHARGE_CURRENT")
-        return float(val) if val is not None else None
-    except Exception:
-        return None
-
-
-def _persist_ccl(new_ccl: float) -> None:
-    """Rewrite MAX_BATTERY_CHARGE_CURRENT in config.ini without touching other keys."""
-    try:
-        cfg = configparser.ConfigParser()
-        cfg.read(CONFIG_PATH)
-        cfg["DEFAULT"]["MAX_BATTERY_CHARGE_CURRENT"] = str(int(new_ccl))
-        with open(CONFIG_PATH, "w") as fh:
-            cfg.write(fh)
-        logger.info("Huawei ESM: persisted MAX_BATTERY_CHARGE_CURRENT=%.0f to config.ini", new_ccl)
-    except Exception as exc:
-        logger.warning("Huawei ESM: could not persist CCL to config.ini: %s", exc)
 
 
 def _fmt_temp(t) -> str:
@@ -222,12 +197,6 @@ class HuaweiEsm(Battery):
         self.max_battery_voltage = 55.0              # overridden by CVL from config
         self.min_battery_voltage = max_cells * 2.80  # 44.8V for 16S
 
-        # CCL: load from config.ini so GUI edits survive restarts
-        saved_ccl = _read_ccl_from_config()
-        if saved_ccl is not None:
-            self.max_battery_charge_current = saved_ccl
-        self._last_persisted_ccl = self.max_battery_charge_current
-
         # Initialize cell array so manage_charge_voltage doesn't crash before first refresh
         self.cell_count = self.total_cells
         self.capacity = float(self.total_capacity_ah)
@@ -336,11 +305,19 @@ class HuaweiEsm(Battery):
         offline_count = sum(1 for p in self.packs if not p.online)
         self.protection.cell_imbalance = 2 if offline_count else 0
 
-        # Persist CCL if user changed it via GUI (/Info/MaxChargeCurrent writeable=True)
+        # Read CCL from Venus OS GUI: Settings → DVCC → Maximum charge current
+        # /Settings/SystemSetup/MaxChargeCurrent — -1 means "no limit set by user"
+        try:
+            import dbus as _dbus
+            _bus = _dbus.SystemBus()
+            _obj = _bus.get_object(_DVCC_CCL_PATH[0], _DVCC_CCL_PATH[1])
+            _val = float(_obj.GetValue())
+            if _val >= 0:
+                self.max_battery_charge_current = _val
+        except Exception:
+            pass  # dbus unavailable or path missing — keep existing value
+
         ccl = self.max_battery_charge_current
-        if ccl is not None and ccl != self._last_persisted_ccl:
-            _persist_ccl(ccl)
-            self._last_persisted_ccl = ccl
 
         logger.info(
             "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% "
