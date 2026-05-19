@@ -204,6 +204,15 @@ class HuaweiEsm(Battery):
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
+        # dbus proxy for DVCC CCL setting — created once, reused every poll cycle
+        self._dvcc_ccl_obj = None
+        try:
+            import dbus as _dbus
+            _bus = _dbus.SystemBus()
+            self._dvcc_ccl_obj = _bus.get_object(_DVCC_CCL_PATH[0], _DVCC_CCL_PATH[1])
+        except Exception:
+            pass  # dbus unavailable (e.g. running outside Venus OS)
+
     def unique_identifier(self) -> str:
         # Fixed string independent of driver version so Venus OS always maps
         # this battery to the same DeviceInstance across upgrades/restarts.
@@ -306,27 +315,27 @@ class HuaweiEsm(Battery):
         self.protection.cell_imbalance = 2 if offline_count else 0
 
         # Read CCL from Venus OS GUI: Settings → DVCC → Maximum charge current
-        # /Settings/SystemSetup/MaxChargeCurrent — -1 means "no limit set by user"
-        try:
-            import dbus as _dbus
-            _bus = _dbus.SystemBus()
-            _obj = _bus.get_object(_DVCC_CCL_PATH[0], _DVCC_CCL_PATH[1])
-            _val = float(_obj.GetValue())
-            if _val >= 0:
-                self.max_battery_charge_current = _val
-        except Exception:
-            pass  # dbus unavailable or path missing — keep existing value
+        # -1 means "no limit set by user" — keep driver's existing value in that case
+        if self._dvcc_ccl_obj is not None:
+            try:
+                _val = float(self._dvcc_ccl_obj.GetValue(
+                    dbus_interface="com.victronenergy.BusItem"
+                ))
+                if _val >= 0:
+                    self.max_battery_charge_current = _val
+            except Exception:
+                pass  # path disappeared or dbus error — keep existing value
 
         ccl = self.max_battery_charge_current
 
         logger.info(
             "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% "
-            "CCL=%.0fA T1=%s T2=%s T3=%s",
+            "CCL=%s T1=%s T2=%s T3=%s",
             len(online), len(self.packs),
             self.voltage,
             sum(p.cell_voltage_avg for p in online) / len(online),
             self.current, self.soc, self.soh,
-            ccl if ccl is not None else 0,
+            ("%.0fA" % ccl) if ccl is not None else "N/A",
             _fmt_temp(pack_temps[0]),
             _fmt_temp(pack_temps[1]),
             _fmt_temp(pack_temps[2] if len(pack_temps) > 2 else None),

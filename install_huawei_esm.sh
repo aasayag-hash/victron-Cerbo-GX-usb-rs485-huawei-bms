@@ -273,7 +273,7 @@ from utils import logger, open_serial_port
 
 DRIVER_VERSION = "1.4.0"
 
-# dbus path written by Venus OS GUI: Settings -> DVCC -> Maximum charge current
+# dbus path written by Venus OS GUI: Settings → DVCC → Maximum charge current
 _DVCC_CCL_PATH = ("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent")
 
 # Format: (slave_id, capacity_ah, model_name, cells_in_series)
@@ -431,6 +431,15 @@ class HuaweiEsm(Battery):
         for _ in range(self.cell_count):
             self.cells.append(Cell(False))
 
+        # dbus proxy for DVCC CCL setting — created once, reused every poll cycle
+        self._dvcc_ccl_obj = None
+        try:
+            import dbus as _dbus
+            _bus = _dbus.SystemBus()
+            self._dvcc_ccl_obj = _bus.get_object(_DVCC_CCL_PATH[0], _DVCC_CCL_PATH[1])
+        except Exception:
+            pass
+
     def unique_identifier(self):
         # Fixed string independent of driver version so Venus OS always maps
         # this battery to the same DeviceInstance across upgrades/restarts.
@@ -521,27 +530,27 @@ class HuaweiEsm(Battery):
         offline_count = sum(1 for p in self.packs if not p.online)
         self.protection.cell_imbalance = 2 if offline_count else 0
 
-        # Read CCL from Venus OS GUI: Settings -> DVCC -> Maximum charge current
-        # /Settings/SystemSetup/MaxChargeCurrent -- -1 means "no limit set by user"
-        try:
-            import dbus as _dbus
-            _bus = _dbus.SystemBus()
-            _obj = _bus.get_object(_DVCC_CCL_PATH[0], _DVCC_CCL_PATH[1])
-            _val = float(_obj.GetValue())
-            if _val >= 0:
-                self.max_battery_charge_current = _val
-        except Exception:
-            pass
+        # Read CCL from Venus OS GUI: Settings → DVCC → Maximum charge current
+        # -1 means "no limit set by user" — keep driver's existing value in that case
+        if self._dvcc_ccl_obj is not None:
+            try:
+                _val = float(self._dvcc_ccl_obj.GetValue(
+                    dbus_interface="com.victronenergy.BusItem"
+                ))
+                if _val >= 0:
+                    self.max_battery_charge_current = _val
+            except Exception:
+                pass
 
         ccl = self.max_battery_charge_current
 
         logger.info(
-            "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% CCL=%.0fA T1=%s T2=%s T3=%s",
+            "Huawei ESM: %d/%d packs | V=%.2fV Vcell=%.3fV I=%.2fA SOC=%.0f%% SOH=%.0f%% CCL=%s T1=%s T2=%s T3=%s",
             len(online), len(self.packs),
             self.voltage,
             sum(p.cell_voltage_avg for p in online) / len(online),
             self.current, self.soc, self.soh,
-            ccl if ccl is not None else 0,
+            ("%.0fA" % ccl) if ccl is not None else "N/A",
             _fmt_temp(pack_temps[0]),
             _fmt_temp(pack_temps[1]),
             _fmt_temp(pack_temps[2] if len(pack_temps) > 2 else None),
@@ -685,17 +694,29 @@ echo ""
 echo "--- Configurando DVCC ---"
 
 # Habilitar DVCC
-dbus -y com.victronenergy.settings /Settings/Services/Bol SetValue 1 >/dev/null 2>&1
-ok "DVCC habilitado"
+if dbus -y com.victronenergy.settings /Settings/Services/Bol SetValue 1 >/dev/null 2>&1; then
+    ok "DVCC habilitado"
+else
+    warn "No se pudo habilitar DVCC — habilitarlo manualmente en Settings → DVCC"
+fi
 
 # Activar límite de corriente de carga y fijar el CCL ingresado por el usuario
-dbus -y com.victronenergy.settings /Settings/SystemSetup/MaxChargeCurrent SetValue "${CCL}" >/dev/null 2>&1
-ok "Maximum charge current fijado en ${CCL}A (editable en Settings → DVCC)"
+if dbus -y com.victronenergy.settings /Settings/SystemSetup/MaxChargeCurrent SetValue "${CCL}" >/dev/null 2>&1; then
+    ok "Maximum charge current fijado en ${CCL}A (editable en Settings → DVCC)"
+else
+    warn "No se pudo fijar MaxChargeCurrent — ajustarlo manualmente en Settings → DVCC"
+fi
 
 # SVS y STS activados
-dbus -y com.victronenergy.settings /Settings/SystemSetup/SharedVoltageSense SetValue 1 >/dev/null 2>&1
-dbus -y com.victronenergy.settings /Settings/SystemSetup/SharedTemperatureSense SetValue 1 >/dev/null 2>&1
-ok "SVS y STS habilitados"
+SVS_OK=true
+STS_OK=true
+dbus -y com.victronenergy.settings /Settings/SystemSetup/SharedVoltageSense SetValue 1 >/dev/null 2>&1    || SVS_OK=false
+dbus -y com.victronenergy.settings /Settings/SystemSetup/SharedTemperatureSense SetValue 1 >/dev/null 2>&1 || STS_OK=false
+if $SVS_OK && $STS_OK; then
+    ok "SVS y STS habilitados"
+else
+    warn "SVS o STS no se pudieron habilitar — verificar en Settings → DVCC"
+fi
 
 # ------------------------------------------------------------------------------
 # 18. Fin
