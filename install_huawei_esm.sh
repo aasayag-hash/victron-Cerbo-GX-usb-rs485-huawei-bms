@@ -977,24 +977,42 @@ echo ""
 echo "--- Escribiendo config.ini ---"
 # El driver lee /data/apps/...; /data/etc/... es una copia que conviene mantener
 # sincronizada para no diagnosticar sobre el archivo equivocado.
-CFG_WRITTEN=0
-for CFG_DIR in /data/apps/dbus-serialbattery /data/etc/dbus-serialbattery; do
-    mkdir -p "$CFG_DIR" || continue
-    cat > "$CFG_DIR/config.ini" << CONFIG_EOF
+# El driver lee /data/apps/...; /data/etc/... es una copia que se mantiene
+# sincronizada para no diagnosticar sobre el archivo equivocado.
+CFG_PRIMARY="/data/apps/dbus-serialbattery"
+CFG_PRIMARY_OK=0
+
+for CFG_DIR in "$CFG_PRIMARY" /data/etc/dbus-serialbattery; do
+    if ! mkdir -p "$CFG_DIR" 2>/dev/null; then
+        warn "No se pudo crear $CFG_DIR"
+        continue
+    fi
+    # Verificar la escritura: un 'cat >' fallido (FS lleno o de solo lectura)
+    # no aborta el script por si solo y dejaria un config.ini vacio o ausente.
+    if ! cat > "$CFG_DIR/config.ini" << CONFIG_EOF
 [DEFAULT]
 BMS_TYPE = HuaweiEsm
 MAX_BATTERY_CHARGE_CURRENT = ${CCL}
 MAX_BATTERY_DISCHARGE_CURRENT = ${DCL}
 CVCM_ENABLE = False
 CONFIG_EOF
+    then
+        warn "Fallo la escritura de $CFG_DIR/config.ini"
+        continue
+    fi
+    if ! grep -q '^BMS_TYPE = HuaweiEsm' "$CFG_DIR/config.ini" 2>/dev/null; then
+        warn "$CFG_DIR/config.ini quedo incompleto"
+        continue
+    fi
     info "config.ini escrito en $CFG_DIR"
-    CFG_WRITTEN=$((CFG_WRITTEN + 1))
+    [ "$CFG_DIR" = "$CFG_PRIMARY" ] && CFG_PRIMARY_OK=1
 done
 
-# El driver lee /data/apps/...: sin config.ini arranca sin BMS_TYPE y tarda
-# minutos escaneando todos los BMS, o no levanta el driver correcto.
-[ "$CFG_WRITTEN" -gt 0 ] || err "No se pudo escribir ningun config.ini."
-ok "config.ini escrito ($CFG_WRITTEN ubicacion/es)"
+# Sin config.ini en la ruta primaria el driver arranca sin BMS_TYPE y tarda
+# minutos escaneando todos los BMS, o no levanta el driver correcto. Que la
+# copia de /data/etc se haya escrito no sirve de nada por si sola.
+[ "$CFG_PRIMARY_OK" = "1" ] || err "No se pudo escribir $CFG_PRIMARY/config.ini (ruta que el driver lee)."
+ok "config.ini escrito"
 
 # ------------------------------------------------------------------------------
 # 13. Configurar serial-starter
