@@ -36,7 +36,7 @@ TTY=${TTY:-/dev/ttyUSB0}
 # ------------------------------------------------------------------------------
 echo ""
 echo "--- Buscando baterias Huawei ESM en el bus RS485 ---"
-echo "Escaneando slaves 214-231 (puede tardar hasta 60 segundos)..."
+echo "Escaneando slaves 214-231 (puede tardar unos minutos)..."
 echo ""
 
 DISCOVERY_RESULT=$(python3 - "$TTY" << 'PYEOF'
@@ -64,28 +64,42 @@ def build_write(slave, reg, values):
         frame += struct.pack(">H", v)
     return frame + struct.pack("<H", crc16(frame))
 
+def crc_ok(frame):
+    # El CRC viaja little-endian al final del frame y cubre todo lo anterior
+    return len(frame) >= 4 and crc16(frame[:-2]) == struct.unpack("<H", frame[-2:])[0]
+
 def read_regs(ser, slave, reg, count):
     ser.reset_input_buffer()
     ser.write(build_read(slave, reg, count))
     time.sleep(0.5)
     expected = 3 + count * 2 + 2
     resp = ser.read(expected)
-    if len(resp) < 5 or (resp[1] & 0x80):
+    # Exigir tamano exacto, cabecera coherente y CRC: un frame truncado se
+    # decodificaria como dato valido y haria detectar capacidades erroneas.
+    if len(resp) != expected:
+        return None
+    if resp[0] != slave or resp[1] != 0x03 or resp[2] != count * 2:
+        return None
+    if not crc_ok(resp):
         return None
     return [struct.unpack(">H", resp[3+i*2:5+i*2])[0] for i in range(count)]
 
 def authenticate(ser, slave):
-    vals = read_regs(ser, slave, 0x0106, 7)
-    if vals is None:
-        return False
-    time.sleep(0.3)
-    now = datetime.now()
-    ser.reset_input_buffer()
-    ser.write(build_write(slave, 0x1000,
-              [now.year, now.month, now.day, now.hour, now.minute, now.second]))
-    time.sleep(0.5)
-    ser.read(8)
-    return True
+    # Reintentos con espera progresiva: las ESM pueden estar en ahorro de
+    # energia y no responder al primer intento (protocolo de wake-up Huawei).
+    for attempt, delay in enumerate((0.4, 1.0, 2.0), start=1):
+        if read_regs(ser, slave, 0x0106, 7) is not None:
+            time.sleep(0.3)
+            now = datetime.now()
+            ser.reset_input_buffer()
+            ser.write(build_write(slave, 0x1000,
+                      [now.year, now.month, now.day, now.hour, now.minute, now.second]))
+            time.sleep(0.5)
+            ser.read(8)
+            return True
+        if attempt < 3:
+            time.sleep(delay)
+    return False
 
 # Model detection: capacity from register 0x0107, cells_in_series from fault reg 0x0047
 # ESM-48xxxB1 all use 16S (confirmed via fault register covering cells 1-16)
@@ -188,10 +202,22 @@ fi
 # ------------------------------------------------------------------------------
 echo ""
 echo "--- Limites de carga/descarga ---"
-read -p "Corriente maxima de CARGA en A [12]: "    CCL
-read -p "Corriente maxima de DESCARGA en A [60]: " DCL
-read -p "Voltaje maximo de carga en V [55.0]: "    CVL
-CCL=${CCL:-12}
+echo ""
+echo "  IMPORTANTE: MAX_BATTERY_CHARGE_CURRENT es un TECHO ABSOLUTO, no un valor"
+echo "  por defecto. El driver aplica min(DVCC, este valor), asi que si lo dejas"
+echo "  bajo, subir la corriente en Settings -> DVCC NO tendra efecto."
+echo ""
+echo "  Recomendado: dejarlo alto (0.2C del banco) y regular el dia a dia desde"
+echo "  la GUI en Settings -> DVCC -> Maximum charge current."
+echo ""
+
+# Techo sugerido: 0.2C del banco detectado (limite tipico de carga de las ESM)
+CCL_SUGGESTED=$(python3 -c "print(int(round(${TOTAL_AH:-100} * 0.2)))" 2>/dev/null || echo 30)
+
+read -p "Techo maximo de CARGA en A [${CCL_SUGGESTED}]: " CCL
+read -p "Corriente maxima de DESCARGA en A [60]: "        DCL
+read -p "Voltaje maximo de carga en V [55.0]: "           CVL
+CCL=${CCL:-$CCL_SUGGESTED}
 DCL=${DCL:-60}
 CVL=${CVL:-55.0}
 
@@ -580,7 +606,7 @@ from datetime import datetime
 from battery import Battery, Cell
 from utils import logger, open_serial_port
 
-DRIVER_VERSION = "1.4.0"
+DRIVER_VERSION = "1.6.0"
 
 # dbus path written by Venus OS GUI: Settings → DVCC → Maximum charge current
 _DVCC_CCL_PATH = ("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent")
@@ -625,13 +651,26 @@ def _build_write_multiple(slave, reg, values):
     return frame + struct.pack("<H", _crc16(frame))
 
 
+def _crc_ok(frame):
+    """El CRC viaja little-endian al final del frame y cubre todo lo anterior."""
+    return len(frame) >= 4 and _crc16(frame[:-2]) == struct.unpack("<H", frame[-2:])[0]
+
+
 def _modbus_read(ser, slave, reg, count):
     ser.reset_input_buffer()
     ser.write(_build_read(slave, reg, count))
     time.sleep(0.4)
     expected = 3 + count * 2 + 2
     resp = ser.read(expected)
-    if len(resp) < 5 or (resp[1] & 0x80):
+    # Un frame truncado o desalineado de >=5 bytes se decodificaria como dato
+    # valido si solo se mirase la longitud minima. Las ESM producen frames
+    # corruptos esporadicos en el bus RS485 que, sin esta validacion, se
+    # publicaban como picos de tension irreales (ej. 56V con I=0.00A).
+    if len(resp) != expected:
+        return None
+    if resp[0] != slave or resp[1] != 0x03 or resp[2] != count * 2:
+        return None
+    if not _crc_ok(resp):
         return None
     return [struct.unpack(">H", resp[3 + i*2: 5 + i*2])[0] for i in range(count)]
 
@@ -640,24 +679,52 @@ def _modbus_write(ser, slave, reg, values):
     ser.reset_input_buffer()
     ser.write(_build_write_multiple(slave, reg, values))
     time.sleep(0.5)
-    return len(ser.read(8)) >= 6
+    resp = ser.read(8)
+    # El eco valido de FC10 son exactamente 8 bytes: slave, 0x10, addr(2),
+    # cantidad(2), crc(2). Un frame corto o con CRC malo NO es confirmacion.
+    return (len(resp) == 8 and resp[0] == slave
+            and resp[1] == 0x10 and _crc_ok(resp))
 
 
-def _authenticate(ser, slave_id, model):
-    vals = _modbus_read(ser, slave_id, REG_UNLOCK, 7)
-    if vals is None:
-        logger.warning("Huawei ESM slave %d: auth step 1 failed", slave_id)
+# Las ESM entran en modo de ahorro de energia y no responden al primer intento.
+# El protocolo de wake-up de Huawei recomienda reintentar con espera progresiva.
+# Se usan esperas cortas porque el ciclo de polling es de ~5s y el bus RS485 es
+# compartido por todos los packs: un backoff largo bloquearia a los demas.
+_AUTH_RETRY_DELAYS = (0.4, 1.0, 2.0)
+
+
+def _authenticate_once(ser, slave_id):
+    """Un intento del handshake de 2 pasos. True si ambos pasos responden."""
+    if _modbus_read(ser, slave_id, REG_UNLOCK, 7) is None:
         return False
     time.sleep(0.3)
     now = datetime.now()
     ok = _modbus_write(ser, slave_id, REG_DATETIME,
                        [now.year, now.month, now.day, now.hour, now.minute, now.second])
     time.sleep(0.5)
-    if not ok:
-        logger.warning("Huawei ESM slave %d: auth step 2 (datetime write) failed", slave_id)
-        return False
-    logger.info("Huawei ESM slave %d (%s): authenticated OK", slave_id, model)
-    return True
+    return ok
+
+
+def _authenticate(ser, slave_id, model):
+    for attempt, delay in enumerate(_AUTH_RETRY_DELAYS, start=1):
+        if _authenticate_once(ser, slave_id):
+            if attempt > 1:
+                logger.info("Huawei ESM slave %d (%s): authenticated OK "
+                            "(intento %d/%d)", slave_id, model,
+                            attempt, len(_AUTH_RETRY_DELAYS))
+            else:
+                logger.info("Huawei ESM slave %d (%s): authenticated OK",
+                            slave_id, model)
+            return True
+        # No esperar despues del ultimo intento fallido
+        if attempt < len(_AUTH_RETRY_DELAYS):
+            logger.debug("Huawei ESM slave %d: auth intento %d fallo, "
+                         "reintentando en %.1fs", slave_id, attempt, delay)
+            time.sleep(delay)
+
+    logger.warning("Huawei ESM slave %d (%s): auth fallo tras %d intentos",
+                   slave_id, model, len(_AUTH_RETRY_DELAYS))
+    return False
 
 
 class HuaweiEsmPack:
@@ -908,14 +975,26 @@ fi
 # ------------------------------------------------------------------------------
 echo ""
 echo "--- Escribiendo config.ini ---"
-cat > /data/apps/dbus-serialbattery/config.ini << CONFIG_EOF
+# El driver lee /data/apps/...; /data/etc/... es una copia que conviene mantener
+# sincronizada para no diagnosticar sobre el archivo equivocado.
+CFG_WRITTEN=0
+for CFG_DIR in /data/apps/dbus-serialbattery /data/etc/dbus-serialbattery; do
+    mkdir -p "$CFG_DIR" || continue
+    cat > "$CFG_DIR/config.ini" << CONFIG_EOF
 [DEFAULT]
 BMS_TYPE = HuaweiEsm
 MAX_BATTERY_CHARGE_CURRENT = ${CCL}
 MAX_BATTERY_DISCHARGE_CURRENT = ${DCL}
 CVCM_ENABLE = False
 CONFIG_EOF
-ok "config.ini escrito"
+    info "config.ini escrito en $CFG_DIR"
+    CFG_WRITTEN=$((CFG_WRITTEN + 1))
+done
+
+# El driver lee /data/apps/...: sin config.ini arranca sin BMS_TYPE y tarda
+# minutos escaneando todos los BMS, o no levanta el driver correcto.
+[ "$CFG_WRITTEN" -gt 0 ] || err "No se pudo escribir ningun config.ini."
+ok "config.ini escrito ($CFG_WRITTEN ubicacion/es)"
 
 # ------------------------------------------------------------------------------
 # 13. Configurar serial-starter

@@ -236,6 +236,34 @@ DEVICE_INSTANCE_ID_BATTERY = 3
 - `CVCM_ENABLE = False`: desactiva la gestión de corriente por voltaje de celda individual, ya que las Huawei ESM no exponen ese dato
 - `DEVICE_INSTANCE_ID_BATTERY`: fijado para que el `BatteryService` apunte siempre al mismo servicio entre reinicios
 
+> ⚠️ **`MAX_BATTERY_CHARGE_CURRENT` es un techo absoluto, no un valor por defecto.**
+> El driver calcula `min(DVCC, MAX_BATTERY_CHARGE_CURRENT)`, así que dejarlo bajo hace
+> que subir la corriente en **Settings → DVCC** no tenga ningún efecto — el driver
+> seguirá publicando el valor de `config.ini` y los cargadores obedecerán ese.
+>
+> Conviene dejarlo alto (≈0.2C del banco) y regular el día a día desde la GUI de DVCC.
+> Para verificar quién está limitando:
+>
+> ```bash
+> dbus -y com.victronenergy.battery.ttyUSB0 /Info/ChargeLimitation GetValue
+> ```
+>
+> Si devuelve `'Max Battery Charge Current'`, está topando `config.ini`.
+> Si devuelve `'BMS Settings'`, manda DVCC.
+
+### Hay dos `config.ini`
+
+| Ruta | Rol |
+|------|-----|
+| `/data/apps/dbus-serialbattery/config.ini` | **el que el driver lee** |
+| `/data/etc/dbus-serialbattery/config.ini` | copia — mantener sincronizada |
+
+El instalador escribe ambos. Al editar a mano, editar los dos y reiniciar:
+
+```bash
+svc -t /service/dbus-serialbattery.ttyUSB0
+```
+
 ---
 
 ## Activar DVCC en Venus OS
@@ -281,6 +309,8 @@ INFO:SerialBattery:Huawei ESM: 3/3 packs | V=50.66V Vcell=3.166V I=9.28A SOC=90%
 | No se crea `/service/dbus-serialbattery.ttyUSB0` | serial-starter no reconoce el adaptador CH340 | Verificar `/data/conf/serial-starter.d/dbus-serialbattery.conf` contiene `alias cgwacs sbattery` |
 | SmartSolar en "BMS controlled: No" | DVCC desactivado | Activar en Configuración → DVCC |
 | Driver tarda ~4 minutos en arrancar | `BMS_TYPE` no configurado (escanea todos los BMS) | Verificar que `config.ini` tenga `BMS_TYPE = HuaweiEsm` |
+| Subir la corriente en DVCC no tiene efecto | `MAX_BATTERY_CHARGE_CURRENT` es un **techo absoluto**: el driver aplica `min(DVCC, config)` | Subir el valor en `config.ini` y reiniciar el servicio (ver más abajo) |
+| Picos de tensión irreales (ej. 56 V con `I=0.00A`) | Frames Modbus corruptos aceptados sin validar CRC | Actualizar el driver a v1.5.0+ |
 | Pack no autenticado tras reconexión | Normal — re-autentica automáticamente en el siguiente ciclo | Esperar un ciclo de polling (~5s) |
 
 ---
