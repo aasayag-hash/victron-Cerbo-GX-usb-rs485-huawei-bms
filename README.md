@@ -89,7 +89,43 @@ Usar estas baterias detectadas? [S/n]:
 Corriente maxima de CARGA en A [12]: 
 Corriente maxima de DESCARGA en A [60]: 
 Voltaje maximo de carga en V [55.0]: 
+
+--- Limite de corriente de carga por bateria (registro 0x100D) ---
+
+[i] Leyendo configuracion actual de 0x100D en cada bateria...
+
+  Configuracion actual:
+
+  Slave   Modelo         Cap      0x100D     Limite carga
+  --------------------------------------------------------------
+  214     ESM-48150B1    150Ah    200        30.0A
+  215     ESM-48150B1    150Ah    200        30.0A
+  216     ESM-48100B1    100Ah    200        20.0A
+
+Corriente de carga a asignar a TODAS las baterias en A [0 = no cambiar]: 30
+
+  Cambios a aplicar (30A en todas):
+
+  Slave   Modelo         Cap      0x100D actual  -> nuevo
+  --------------------------------------------------------------------
+  214     ESM-48150B1    150Ah    200 (30.0A)    200 (= 30A)
+  215     ESM-48150B1    150Ah    200 (30.0A)    200 (= 30A)
+  216     ESM-48100B1    100Ah    200 (20.0A)    300 (= 30A)
 ```
+
+### Emparejar la corriente de carga entre baterías
+
+El instalador incluye un paso opcional que lee el registro `0x100D` de cada batería, muestra
+la configuración actual convertida a amperios, y permite asignar **una misma corriente de carga
+a todas** — encargándose de convertir a C-rate según la capacidad de cada pack.
+
+- El valor por defecto es `0` (**no modificar nada**)
+- Muestra una previsualización de los cambios antes de pedir confirmación
+- Tras escribir, **relee** cada registro para verificar que el BMS aceptó el valor
+- **No toca** `0x101B` ni el bloque `0x127x`
+
+Es útil cuando el banco mezcla capacidades: de fábrica, packs de distinto tamaño con el mismo
+valor crudo cargan a corrientes distintas.
 
 ---
 
@@ -146,6 +182,43 @@ Las Huawei ESM requieren autenticación después de cada ciclo de energía o rec
 | `0x0006` | Temperatura mínima de celda | °C | uint16 |
 | `0x000A` | Status bitfield | — | uint16 |
 | `0x0107` | Capacidad nominal | Ah | uint16 |
+
+### Límites de corriente (lectura/escritura, FC03/FC10)
+
+> ⚠️ **Estos registros NO están en amperios.** Son coeficientes de **C-rate con escala 0.001**.
+> La documentación de terceros que los lista como "A, factor 1" es incorrecta. Las etiquetas
+> oficiales de Huawei los llaman *"Charge Limit **Coef**"* (充电限流点).
+
+| Registro | Descripción | Escala | Notas |
+|----------|-------------|--------|-------|
+| `0x100D` | Límite de corriente de **carga** | C × 0.001 | R/W, persistente en el BMS |
+| `0x100B` | Límite de corriente de **descarga** | C × 0.001 | R/W, persistente en el BMS |
+| `0x101B` | Límite de carga **por defecto** (fábrica) | C × 0.001 | **No modificar** — es el valor de respaldo |
+
+Conversión:
+
+```
+valor_crudo = round(amperios / capacidad_Ah * 1000)
+amperios    = valor_crudo * 0.001 * capacidad_Ah
+```
+
+**Consecuencia importante:** como el valor es relativo a la capacidad, fijar la *misma*
+corriente en baterías de distinta capacidad requiere escribir valores crudos **distintos**:
+
+| Objetivo | Pack 150 Ah | Pack 100 Ah |
+|----------|-------------|-------------|
+| 30 A | `200` | `300` |
+
+De fábrica todos los packs traen `0x100D = 200`, lo que **no** significa la misma corriente:
+son 30 A en uno de 150 Ah pero sólo 20 A en uno de 100 Ah.
+
+Verificación empírica de la escala: en una instalación con packs de 150/150/100 Ah, el
+registro `0x100B` traía valores distintos (680 / 680 / 1020) que corresponden todos a
+exactamente **102.0 A**. En amperios directos serían 680 A y 1020 A, imposible para esos packs.
+
+> **Nota:** el bloque `0x1270-0x127F` (umbrales de protección de sobrecorriente, incluido
+> `0x127E`) **no responde** en los modelos ESM-48150B1 / ESM-48100B1 probados. No está
+> implementado en su firmware.
 
 ---
 

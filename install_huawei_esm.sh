@@ -196,6 +196,315 @@ DCL=${DCL:-60}
 CVL=${CVL:-55.0}
 
 # ------------------------------------------------------------------------------
+# 4b. Limite de corriente de carga por pack (registro 0x100D)
+# ------------------------------------------------------------------------------
+# El registro 0x100D de las Huawei ESM NO esta en amperios: es un coeficiente
+# de C-rate con escala 0.001 ("Charge Limit Coef" / 充电限流点 en la doc oficial
+# Huawei). Por eso el valor a escribir depende de la capacidad de cada pack:
+#
+#     valor = round(amperios / capacidad_Ah * 1000)
+#
+# Ejemplo para 30 A: pack de 150Ah -> 200 ; pack de 100Ah -> 300
+#
+# Es un registro de configuracion PERSISTENTE en el BMS. Por eso se lee primero
+# el valor actual de cada pack y se muestra su interpretacion, para confirmar
+# que la escala es correcta antes de escribir nada.
+#
+# NO se tocan 0x101B (Default Charge Limit Coef, valor de fabrica) ni 0x127E
+# (bloque de umbrales de proteccion de sobrecorriente).
+echo ""
+echo "--- Limite de corriente de carga por bateria (registro 0x100D) ---"
+echo ""
+info "Leyendo configuracion actual de 0x100D en cada bateria..."
+echo ""
+
+CCL_READ=$(python3 - "$TTY" "$PACK_CONFIG" << 'PYEOF'
+import sys, struct, time, serial, ast
+from datetime import datetime
+
+port, packs = sys.argv[1], ast.literal_eval(sys.argv[2])
+REG_CHG_LIMIT = 0x100D
+
+def crc16(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+def build_read(slave, reg, count):
+    f = struct.pack(">BBHH", slave, 0x03, reg, count)
+    return f + struct.pack("<H", crc16(f))
+
+def build_write(slave, reg, values):
+    n = len(values)
+    f = struct.pack(">BBHHB", slave, 0x10, reg, n, n * 2)
+    for v in values:
+        f += struct.pack(">H", v)
+    return f + struct.pack("<H", crc16(f))
+
+def crc_ok(frame):
+    # El CRC viaja little-endian al final del frame y cubre todo lo anterior
+    return len(frame) >= 4 and crc16(frame[:-2]) == struct.unpack("<H", frame[-2:])[0]
+
+def read_regs(ser, slave, reg, count):
+    ser.reset_input_buffer()
+    ser.write(build_read(slave, reg, count))
+    time.sleep(0.5)
+    expected = 3 + count * 2 + 2
+    resp = ser.read(expected)
+    # Un frame truncado de >=5 bytes se decodificaria como dato valido si solo
+    # se mirase la longitud minima: exigir tamano exacto, cabecera y CRC.
+    if len(resp) != expected:
+        return None
+    if resp[0] != slave or resp[1] != 0x03 or resp[2] != count * 2:
+        return None
+    if not crc_ok(resp):
+        return None
+    return [struct.unpack(">H", resp[3+i*2:5+i*2])[0] for i in range(count)]
+
+def authenticate(ser, slave):
+    if read_regs(ser, slave, 0x0106, 7) is None:
+        return False
+    time.sleep(0.3)
+    now = datetime.now()
+    ser.reset_input_buffer()
+    ser.write(build_write(slave, 0x1000,
+              [now.year, now.month, now.day, now.hour, now.minute, now.second]))
+    time.sleep(0.5)
+    ser.read(8)
+    return True
+
+try:
+    ser = serial.Serial(port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1)
+except Exception as e:
+    sys.stderr.write("Error abriendo %s: %s\n" % (port, e))
+    sys.exit(1)
+
+for slave, cap, model, cells in packs:
+    if not authenticate(ser, slave):
+        print("%d|%s|%d|ERR|auth" % (slave, model, cap))
+        continue
+    vals = read_regs(ser, slave, REG_CHG_LIMIT, 1)
+    if vals is None:
+        print("%d|%s|%d|ERR|read" % (slave, model, cap))
+        continue
+    raw = vals[0]
+    amps_now = raw * 0.001 * cap                      # interpretacion C-rate
+    print("%d|%s|%d|%d|%.1f" % (slave, model, cap, raw, amps_now))
+    time.sleep(0.2)
+
+ser.close()
+PYEOF
+)
+
+if [ -z "$CCL_READ" ]; then
+    warn "No se pudo leer 0x100D de ninguna bateria."
+    warn "Se omite el ajuste. El control de carga queda a cargo de DVCC."
+else
+    # --- Configuracion actual de las baterias ---
+    echo "  Configuracion actual:"
+    echo ""
+    printf "  %-7s %-14s %-8s %-10s %s\n" "Slave" "Modelo" "Cap" "0x100D" "Limite carga"
+    echo "  --------------------------------------------------------------"
+    CCL_ERRORS=0
+    CCL_OK_COUNT=0
+    while IFS='|' read -r s model cap raw amps; do
+        [ -z "$s" ] && continue
+        if [ "$raw" = "ERR" ]; then
+            printf "  %-7s %-14s %-8s %s\n" "$s" "$model" "${cap}Ah" "ERROR ($amps)"
+            CCL_ERRORS=$((CCL_ERRORS + 1))
+        else
+            printf "  %-7s %-14s %-8s %-10s %s\n" "$s" "$model" "${cap}Ah" "$raw" "${amps}A"
+            CCL_OK_COUNT=$((CCL_OK_COUNT + 1))
+        fi
+    done <<< "$CCL_READ"
+    echo ""
+
+    if [ "$CCL_ERRORS" -gt 0 ]; then
+        warn "$CCL_ERRORS bateria(s) no respondieron a la lectura."
+    fi
+
+    echo "  La columna 'Limite carga' interpreta 0x100D como C-rate x 0.001"
+    echo "  (0x100D = 'Charge Limit Coef' en la documentacion oficial Huawei)."
+    echo "  Si esos amperios NO son coherentes con las baterias, la escala es"
+    echo "  distinta: dejar el valor en 0 para no modificar nada."
+    echo ""
+
+    if [ "$CCL_OK_COUNT" -eq 0 ]; then
+        warn "Ninguna bateria respondio. Se omite el ajuste."
+    else
+        # --- Valor unico para todas las baterias ---
+        read -p "Corriente de carga a asignar a TODAS las baterias en A [0 = no cambiar]: " PACK_CCL_A
+        PACK_CCL_A=${PACK_CCL_A:-0}
+
+        if ! echo "$PACK_CCL_A" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+            warn "Valor invalido '$PACK_CCL_A'. Se omite el ajuste."
+            PACK_CCL_A=0
+        fi
+    fi
+
+    CCL_POSITIVE=0
+    if [ "${CCL_OK_COUNT:-0}" -gt 0 ]; then
+        CCL_POSITIVE=$(python3 -c "print(1 if float('${PACK_CCL_A:-0}') > 0 else 0)" 2>/dev/null)
+        if [ -z "$CCL_POSITIVE" ]; then
+            warn "No se pudo evaluar el valor ingresado ('$PACK_CCL_A'). Se omite el ajuste."
+            CCL_POSITIVE=0
+        fi
+    fi
+
+    if [ "$CCL_POSITIVE" = "1" ]; then
+        # Cada pack necesita un valor crudo distinto porque 0x100D es C-rate,
+        # relativo a la capacidad: valor = round(A / capacidad_Ah * 1000)
+        echo ""
+        echo "  Cambios a aplicar (${PACK_CCL_A}A en todas):"
+        echo ""
+        printf "  %-7s %-14s %-8s %-14s %s\n" "Slave" "Modelo" "Cap" "0x100D actual" "-> nuevo"
+        echo "  --------------------------------------------------------------------"
+        CCL_WRITE_PLAN=""
+        while IFS='|' read -r s model cap raw amps; do
+            [ -z "$s" ] && continue
+            [ "$raw" = "ERR" ] && continue
+            tgt=$(python3 -c "print(int(round($PACK_CCL_A / $cap * 1000)))" 2>/dev/null)
+            if ! echo "$tgt" | grep -qE '^[0-9]+$' || [ "$tgt" -lt 1 ] || [ "$tgt" -gt 65535 ]; then
+                printf "  %-7s %-14s %-8s %s\n" \
+                       "$s" "$model" "${cap}Ah" "OMITIDA (valor fuera de rango)"
+                continue
+            fi
+            printf "  %-7s %-14s %-8s %-14s %s\n" \
+                   "$s" "$model" "${cap}Ah" "$raw (${amps}A)" "$tgt (= ${PACK_CCL_A}A)"
+            CCL_WRITE_PLAN+="${s}|${model}|${cap}|${raw}|${amps}|${tgt}"$'\n'
+        done <<< "$CCL_READ"
+        echo ""
+        echo "  Nota: el valor crudo difiere entre baterias de distinta capacidad"
+        echo "  porque 0x100D es un coeficiente C-rate, no amperios."
+        echo ""
+        warn "0x100D es configuracion PERSISTENTE del BMS de cada bateria."
+        echo ""
+
+        if [ -z "$CCL_WRITE_PLAN" ]; then
+            warn "Ninguna bateria quedo con un valor valido. Se omite el ajuste."
+            CCL_CONFIRM=N
+        else
+            read -p "Confirmar la escritura? [s/N]: " CCL_CONFIRM
+            CCL_CONFIRM=${CCL_CONFIRM:-N}
+        fi
+
+        if [[ "$CCL_CONFIRM" =~ ^[Ss]$ ]]; then
+            echo ""
+            info "Escribiendo 0x100D en cada bateria..."
+            python3 - "$TTY" "$CCL_WRITE_PLAN" << 'PYEOF'
+import sys, struct, time, serial
+from datetime import datetime
+
+port = sys.argv[1]
+rows = [l.split("|") for l in sys.argv[2].strip().splitlines() if l.strip()]
+REG_CHG_LIMIT = 0x100D
+
+def crc16(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+def build_read(slave, reg, count):
+    f = struct.pack(">BBHH", slave, 0x03, reg, count)
+    return f + struct.pack("<H", crc16(f))
+
+def build_write(slave, reg, values):
+    n = len(values)
+    f = struct.pack(">BBHHB", slave, 0x10, reg, n, n * 2)
+    for v in values:
+        f += struct.pack(">H", v)
+    return f + struct.pack("<H", crc16(f))
+
+def crc_ok(frame):
+    # El CRC viaja little-endian al final del frame y cubre todo lo anterior
+    return len(frame) >= 4 and crc16(frame[:-2]) == struct.unpack("<H", frame[-2:])[0]
+
+def read_regs(ser, slave, reg, count):
+    ser.reset_input_buffer()
+    ser.write(build_read(slave, reg, count))
+    time.sleep(0.5)
+    expected = 3 + count * 2 + 2
+    resp = ser.read(expected)
+    # Un frame truncado de >=5 bytes se decodificaria como dato valido si solo
+    # se mirase la longitud minima: exigir tamano exacto, cabecera y CRC.
+    if len(resp) != expected:
+        return None
+    if resp[0] != slave or resp[1] != 0x03 or resp[2] != count * 2:
+        return None
+    if not crc_ok(resp):
+        return None
+    return [struct.unpack(">H", resp[3+i*2:5+i*2])[0] for i in range(count)]
+
+def authenticate(ser, slave):
+    if read_regs(ser, slave, 0x0106, 7) is None:
+        return False
+    time.sleep(0.3)
+    now = datetime.now()
+    ser.reset_input_buffer()
+    ser.write(build_write(slave, 0x1000,
+              [now.year, now.month, now.day, now.hour, now.minute, now.second]))
+    time.sleep(0.5)
+    ser.read(8)
+    return True
+
+ser = serial.Serial(port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1)
+
+for row in rows:
+    if len(row) < 6 or row[3] == "ERR":
+        continue
+    slave, model, cap, raw, amps, tgt = int(row[0]), row[1], int(row[2]), int(row[3]), row[4], int(row[5])
+
+    if not authenticate(ser, slave):
+        sys.stderr.write("  [ERR] slave %d: auth fallo, no se escribe\n" % slave)
+        continue
+
+    ser.reset_input_buffer()
+    ser.write(build_write(slave, REG_CHG_LIMIT, [tgt]))
+    time.sleep(0.5)
+    resp = ser.read(8)
+    # El eco valido de FC10 son exactamente 8 bytes: slave, 0x10, addr(2),
+    # cantidad(2), crc(2). Un frame corto o con CRC malo NO es una confirmacion.
+    if len(resp) != 8 or resp[0] != slave or resp[1] != 0x10 or not crc_ok(resp):
+        if len(resp) >= 2 and resp[1] & 0x80:
+            code = resp[2] if len(resp) > 2 else 0
+            sys.stderr.write("  [ERR] slave %d (%s): la bateria rechazo la escritura "
+                             "(excepcion Modbus 0x%02X)\n" % (slave, model, code))
+        else:
+            sys.stderr.write("  [ERR] slave %d (%s): sin confirmacion valida de la escritura "
+                             "(%d bytes)\n" % (slave, model, len(resp)))
+        continue
+
+    time.sleep(0.3)
+    back = read_regs(ser, slave, REG_CHG_LIMIT, 1)
+    if back is None:
+        sys.stderr.write("  [WARN] slave %d: escrito pero no se pudo releer\n" % slave)
+    elif back[0] == tgt:
+        sys.stderr.write("  [OK] slave %d (%s): 0x100D = %d (= %.1fA sobre %dAh)\n"
+                         % (slave, model, tgt, tgt * 0.001 * cap, cap))
+    else:
+        sys.stderr.write("  [WARN] slave %d: se escribio %d pero la bateria reporta %d\n"
+                         % (slave, tgt, back[0]))
+    time.sleep(0.2)
+
+ser.close()
+PYEOF
+            echo ""
+            ok "Escritura de 0x100D finalizada."
+        else
+            warn "Escritura de 0x100D omitida. Las baterias quedan como estaban."
+        fi
+    else
+        info "0x100D sin cambios. El control de carga queda a cargo de DVCC."
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # 5. Resumen y confirmacion
 # ------------------------------------------------------------------------------
 echo ""
