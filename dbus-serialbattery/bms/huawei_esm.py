@@ -301,8 +301,11 @@ class HuaweiEsm(Battery):
         # Temp 1 = pack 0, Temp 2 = pack 1, Temp 3 = pack 2
         # Direct assignment for all slots: to_temperature() crashes on None input
         pack_temps = [p.temp_avg if p.online else None for p in self.packs]
-        self.temperature_1 = pack_temps[0]
-        self.temperature_2 = pack_temps[1]
+        # dbushelper multiplies temperature_1/_2 without a None check, so an
+        # offline pack in slot 1 or 2 would crash the driver: fall back to an online pack
+        fallback_temp = next(t for t in pack_temps if t is not None)
+        self.temperature_1 = pack_temps[0] if pack_temps[0] is not None else fallback_temp
+        self.temperature_2 = pack_temps[1] if len(pack_temps) > 1 and pack_temps[1] is not None else fallback_temp
         self.temperature_3 = pack_temps[2] if len(pack_temps) > 2 else None
         self.temperature_4 = None
 
